@@ -332,6 +332,299 @@ async function isAdminUser(env, userId) {
     }
 }
 
+// ---------------- 命令注册与解析 ----------------
+
+// 管理员群组内可用的命令：同时用于 setMyCommands 菜单与 /help 卡片
+const ADMIN_COMMANDS = [
+    { command: "menu",    description: "🛠️ 打开控制面板" },
+    { command: "close",   description: "🚫 关闭当前对话" },
+    { command: "open",    description: "✅ 恢复当前对话" },
+    { command: "ban",     description: "⛔ 封禁该用户" },
+    { command: "unban",   description: "✅ 解封该用户" },
+    { command: "trust",   description: "🌟 设为永久信任" },
+    { command: "untrust", description: "🔄 取消永久信任" },
+    { command: "reset",   description: "🔄 重置该用户验证" },
+    { command: "info",    description: "👤 查看用户信息" },
+    { command: "cleanup", description: "🧹 清理已删除话题的用户" },
+    { command: "help",    description: "❓ 查看全部指令" }
+];
+
+// 实例内标记：注册成功后不再重复请求 API
+let commandsRegistered = false;
+
+async function registerCommands(env) {
+    const res = await tgCall(env, "setMyCommands", {
+        commands: ADMIN_COMMANDS,
+        scope: { type: "chat", chat_id: env.SUPERGROUP_ID }
+    });
+    if (!res.ok) {
+        Logger.warn('set_my_commands_failed', { description: res.description });
+        return false;
+    }
+    Logger.info('set_my_commands_ok', { count: ADMIN_COMMANDS.length });
+    return true;
+}
+
+// 部署后自动注册一次命令菜单（KV 标记，避免每次 update 都打 API）
+async function ensureCommandsRegistered(env) {
+    if (commandsRegistered) return;
+    try {
+        const flag = await env.TOPIC_MAP.get("sys:commands_v1");
+        if (flag === "1") {
+            commandsRegistered = true;
+            return;
+        }
+        if (await registerCommands(env)) {
+            commandsRegistered = true;
+            await env.TOPIC_MAP.put("sys:commands_v1", "1");
+        }
+    } catch (e) {
+        Logger.warn('ensure_commands_failed', { error: String(e && e.message) });
+    }
+}
+
+// 解析 /cmd、/cmd@bot、/cmd 参数 三种写法
+function parseCommand(text) {
+    const m = /^\/([A-Za-z0-9_]+)(?:@([A-Za-z0-9_]+))?(?:\s+([\s\S]*))?$/.exec((text || "").trim());
+    if (!m) return null;
+    return { cmd: m[1].toLowerCase(), via: (m[2] || "").toLowerCase(), args: (m[3] || "").trim() };
+}
+
+function isKnownAdminCommand(cmd) {
+    return ADMIN_COMMANDS.some(c => c.command === cmd);
+}
+
+// 转义用户可控文本中的 Markdown 保留字符，避免 parse_mode 解析失败
+function escapeMd(text) {
+    return (text || "").toString().replace(/([_*`\[\]])/g, "\\$1");
+}
+// ---------------- 话题控制面板 ----------------
+
+function panelButton(text, action, userId) {
+    return { text, callback_data: `adm:${action}:${userId}` };
+}
+
+// 按钮随状态切换：关闭/恢复、封禁/解封、信任/取消信任
+function buildPanelKeyboard(state, userId) {
+    const row1 = [
+        state.closed ? panelButton("✅ 恢复对话", "open", userId) : panelButton("🚫 关闭对话", "close", userId),
+        panelButton("👤 用户信息", "info", userId)
+    ];
+    const row2 = [
+        state.banned ? panelButton("✅ 解封", "unban", userId) : panelButton("⛔ 封禁", "ban", userId),
+        state.trusted ? panelButton("🔄 取消信任", "untrust", userId) : panelButton("🌟 永久信任", "trust", userId)
+    ];
+    const row3 = [
+        panelButton("🔄 重置验证", "reset", userId),
+        panelButton("🔁 刷新面板", "refresh", userId)
+    ];
+    return { inline_keyboard: [row1, row2, row3] };
+}
+
+async function getUserState(env, userId) {
+    const rec = await safeGetJSON(env, `user:${userId}`, null);
+    const verified = await env.TOPIC_MAP.get(`verified:${userId}`);
+    const banned = await env.TOPIC_MAP.get(`banned:${userId}`);
+    return {
+        rec,
+        closed: !!(rec && rec.closed),
+        banned: !!banned,
+        verified: !!verified,
+        trusted: verified === "trusted"
+    };
+}
+
+function buildPanelText(userId, threadId, state) {
+    const status = [];
+    if (state.banned) status.push("⛔ 已封禁");
+    if (state.closed) status.push("🚫 已关闭");
+    if (state.trusted) status.push("🌟 永久信任");
+    else if (state.verified) status.push("✅ 已验证");
+    if (status.length === 0) status.push("✅ 正常");
+
+    return `🛠️ **控制面板**\n\n` +
+        `👤 话题: ${escapeMd(state.rec?.title || "未知")}\n` +
+        `🆔 UID: \`${userId}\`\n` +
+        `🧵 Topic: \`${threadId}\`\n` +
+        `状态: ${status.join(" / ")}\n\n` +
+        `点击按钮操作，或直接发送指令。`;
+}
+
+// 下发并置顶控制面板；任何失败都不影响主流程
+async function sendTopicPanel(env, userId, threadId, { pin = true } = {}) {
+    try {
+        const state = await getUserState(env, userId);
+        const res = await tgCall(env, "sendMessage", withMessageThreadId({
+            chat_id: env.SUPERGROUP_ID,
+            text: buildPanelText(userId, threadId, state),
+            parse_mode: "Markdown",
+            reply_markup: buildPanelKeyboard(state, userId),
+            disable_notification: true
+        }, threadId));
+
+        if (!res.ok) {
+            Logger.warn('panel_send_failed', { userId, threadId, description: res.description });
+            return null;
+        }
+
+        const messageId = res.result?.message_id;
+        if (pin && messageId) {
+            const pinRes = await tgCall(env, "pinChatMessage", {
+                chat_id: env.SUPERGROUP_ID,
+                message_id: messageId,
+                message_thread_id: threadId,
+                disable_notification: true
+            });
+            if (!pinRes.ok) {
+                Logger.warn('panel_pin_failed', { threadId, description: pinRes.description });
+            }
+        }
+
+        Logger.info('panel_sent', { userId, threadId, messageId });
+        return messageId;
+    } catch (e) {
+        Logger.warn('panel_send_error', { userId, threadId, error: String(e && e.message) });
+        return null;
+    }
+}
+
+// 就地刷新面板（按钮 + 文案），失败忽略
+async function refreshPanelMessage(query, env, userId, threadId) {
+    const messageId = query.message?.message_id;
+    if (!messageId) return;
+    try {
+        const state = await getUserState(env, userId);
+        await tgCall(env, "editMessageText", {
+            chat_id: env.SUPERGROUP_ID,
+            message_id: messageId,
+            text: buildPanelText(userId, threadId, state),
+            parse_mode: "Markdown",
+            reply_markup: buildPanelKeyboard(state, userId)
+        });
+    } catch (e) {
+        Logger.warn('panel_refresh_failed', { userId, threadId, error: String(e && e.message) });
+    }
+}
+
+// 统一执行管理员动作：指令与按钮共用同一套逻辑
+async function performAdminAction(action, userId, threadId, env) {
+    const key = `user:${userId}`;
+
+    switch (action) {
+        case "close": {
+            const rec = await safeGetJSON(env, key, null);
+            if (!rec) return { ok: false, toast: "找不到该用户记录" };
+            rec.closed = true;
+            await env.TOPIC_MAP.put(key, JSON.stringify(rec));
+            await tgCall(env, "closeForumTopic", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId });
+            return { ok: true, toast: "已关闭对话", text: "🚫 **对话已强制关闭**" };
+        }
+        case "open": {
+            const rec = await safeGetJSON(env, key, null);
+            if (!rec) return { ok: false, toast: "找不到该用户记录" };
+            rec.closed = false;
+            await env.TOPIC_MAP.put(key, JSON.stringify(rec));
+            await tgCall(env, "reopenForumTopic", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId });
+            return { ok: true, toast: "已恢复对话", text: "✅ **对话已恢复**" };
+        }
+        case "ban":
+            await env.TOPIC_MAP.put(`banned:${userId}`, "1");
+            return { ok: true, toast: "已封禁该用户", text: "🚫 **用户已封禁**" };
+        case "unban":
+            await env.TOPIC_MAP.delete(`banned:${userId}`);
+            return { ok: true, toast: "已解封该用户", text: "✅ **用户已解封**" };
+        case "trust":
+            await env.TOPIC_MAP.put(`verified:${userId}`, "trusted");
+            await env.TOPIC_MAP.delete(`needs_verify:${userId}`);
+            return { ok: true, toast: "已设为永久信任", text: "🌟 **已设置永久信任**" };
+        case "untrust":
+            await env.TOPIC_MAP.delete(`verified:${userId}`);
+            return { ok: true, toast: "已取消永久信任", text: "🔄 **已取消永久信任**，用户下次发消息需重新验证" };
+        case "reset":
+            await env.TOPIC_MAP.delete(`verified:${userId}`);
+            await env.TOPIC_MAP.delete(`needs_verify:${userId}`);
+            return { ok: true, toast: "验证已重置", text: "🔄 **验证重置**" };
+        case "info": {
+            const state = await getUserState(env, userId);
+            const verifyText = state.trusted ? "🌟 永久信任" : (state.verified ? "✅ 已验证" : "❌ 未验证");
+            const text = `👤 **用户信息**\nUID: \`${userId}\`\nTopic ID: \`${threadId}\`\n话题标题: ${escapeMd(state.rec?.title || "未知")}\n验证状态: ${verifyText}\n封禁状态: ${state.banned ? "🚫 已封禁" : "✅ 正常"}\n对话状态: ${state.closed ? "🚫 已关闭" : "✅ 正常"}\nLink: [点击私聊](tg://user?id=${userId})`;
+            return { ok: true, toast: "用户信息已发送", text };
+        }
+        default:
+            return { ok: false, toast: "未知操作" };
+    }
+}
+
+async function sendHelpCard(env, threadId) {
+    const lines = ADMIN_COMMANDS.map(c => `/${c.command} — ${c.description}`).join("\n");
+    await tgCall(env, "sendMessage", withMessageThreadId({
+        chat_id: env.SUPERGROUP_ID,
+        text: `❓ **管理员指令**\n\n${lines}\n\n💡 话题内的常驻面板可直接点击；发送 /menu 可重新生成面板。`,
+        parse_mode: "Markdown",
+        disable_notification: true
+    }, threadId));
+}
+
+// 面板按钮回调：必须同时满足「点击者是管理员」与「按钮所属话题匹配」
+async function handleAdminCallback(query, env) {
+    const parts = (query.data || "").split(":");
+    if (parts.length !== 3) return;
+
+    const action = parts[1];
+    const userId = Number(parts[2]);
+    if (!action || !Number.isFinite(userId)) return;
+
+    const clickerId = query.from?.id;
+    if (!clickerId || !(await isAdminUser(env, clickerId))) {
+        await tgCall(env, "answerCallbackQuery", {
+            callback_query_id: query.id,
+            text: "❌ 仅管理员可操作",
+            show_alert: true
+        });
+        return;
+    }
+
+    const threadId = query.message?.message_thread_id;
+
+    // 防跨话题误操作：面板里的 userId 必须与话题映射一致
+    if (threadId) {
+        const mappedUser = await env.TOPIC_MAP.get(`thread:${threadId}`);
+        if (mappedUser && Number(mappedUser) !== userId) {
+            await tgCall(env, "answerCallbackQuery", {
+                callback_query_id: query.id,
+                text: "❌ 面板已过期，请发送 /menu 刷新",
+                show_alert: true
+            });
+            return;
+        }
+    }
+
+    if (action === "refresh") {
+        await tgCall(env, "answerCallbackQuery", { callback_query_id: query.id, text: "🔄 已刷新" });
+        await refreshPanelMessage(query, env, userId, threadId);
+        return;
+    }
+
+    const result = await performAdminAction(action, userId, threadId, env);
+
+    await tgCall(env, "answerCallbackQuery", {
+        callback_query_id: query.id,
+        text: result.ok ? `✅ ${result.toast}` : `❌ ${result.toast}`,
+        show_alert: !result.ok
+    });
+
+    if (result.ok) {
+        await tgCall(env, "sendMessage", withMessageThreadId({
+            chat_id: env.SUPERGROUP_ID,
+            text: result.text,
+            parse_mode: "Markdown",
+            disable_notification: true
+        }, threadId));
+        await refreshPanelMessage(query, env, userId, threadId);
+    }
+
+    Logger.info('admin_button_action', { action, userId, threadId, by: clickerId, ok: result.ok });
+}
 // 获取所有 KV keys（处理分页）
 async function getAllKeys(env, prefix) {
     const allKeys = [];
@@ -389,7 +682,16 @@ export default {
         return new Response("Error: SUPERGROUP_ID must start with -100");
     }
 
+    // 手动注册命令菜单：GET ?setup=1（首次部署或改动命令后访问一次即可）
+    if (request.method === "GET" && new URL(request.url).searchParams.get("setup") === "1") {
+        const ok = await registerCommands(normalizedEnv);
+        return new Response(ok ? "OK: commands registered" : "ERROR: setMyCommands failed, check logs");
+    }
+
     if (request.method !== "POST") return new Response("OK");
+
+    // 自动注册一次命令菜单（KV 标记，成功后不再调用）
+    ctx.waitUntil(ensureCommandsRegistered(normalizedEnv));
 
     // 验证 Content-Type
     const contentType = request.headers.get("content-type") || "";
@@ -711,10 +1013,26 @@ async function handleAdminReply(msg, env, ctx) {
       return;
   }
 
-  // 【修复】允许在任何话题执行 /cleanup 命令
-  if (text === "/cleanup") {
-      // /cleanup 可能处理较久，使用 waitUntil 防止 webhook 请求超时导致“卡住”
+  const parsed = parseCommand(text);
+
+  // 【修复】未知指令只在本话题提示，绝不转发给用户
+  if (parsed && !isKnownAdminCommand(parsed.cmd)) {
+      await tgCall(env, "sendMessage", withMessageThreadId({
+          chat_id: env.SUPERGROUP_ID,
+          text: `❓ 未知指令 \`/${parsed.cmd}\`\n\n发送 /menu 打开控制面板，或 /help 查看全部指令。`,
+          parse_mode: "Markdown"
+      }, threadId));
+      return;
+  }
+
+  // 允许在任何话题执行 /cleanup 与 /help（无需反查用户）
+  if (parsed && parsed.cmd === "cleanup") {
       ctx.waitUntil(handleCleanupCommand(threadId, env));
+      return;
+  }
+
+  if (parsed && parsed.cmd === "help") {
+      await sendHelpCard(env, threadId);
       return;
   }
 
@@ -735,67 +1053,22 @@ async function handleAdminReply(msg, env, ctx) {
   }
 
   // 如果找不到用户，说明可能是在普通话题，或者数据丢失，直接返回
-  if (!userId) return; 
+  if (!userId) return;
 
-  // --- 指令区域 ---
-
-  if (text === "/close") {
-      const key = `user:${userId}`;
-      let rec = await safeGetJSON(env, key, null);
-      if (rec) {
-          rec.closed = true;
-          await env.TOPIC_MAP.put(key, JSON.stringify(rec));
-          await tgCall(env, "closeForumTopic", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId });
-          await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: "🚫 **对话已强制关闭**", parse_mode: "Markdown" });
-      }
+  // /menu：在当前话题重新下发控制面板（不重复置顶）
+  if (parsed && parsed.cmd === "menu") {
+      await sendTopicPanel(env, userId, threadId, { pin: false });
       return;
   }
 
-  if (text === "/open") {
-      const key = `user:${userId}`;
-      let rec = await safeGetJSON(env, key, null);
-      if (rec) {
-          rec.closed = false;
-          await env.TOPIC_MAP.put(key, JSON.stringify(rec));
-          await tgCall(env, "reopenForumTopic", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId });
-          await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: "✅ **对话已恢复**", parse_mode: "Markdown" });
-      }
-      return;
-  }
-
-  if (text === "/reset") {
-      await env.TOPIC_MAP.delete(`verified:${userId}`);
-      await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: "🔄 **验证重置**", parse_mode: "Markdown" });
-      return;
-  }
-
-  if (text === "/trust") {
-      await env.TOPIC_MAP.put(`verified:${userId}`, "trusted");
-      await env.TOPIC_MAP.delete(`needs_verify:${userId}`);
-      await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: "🌟 **已设置永久信任**", parse_mode: "Markdown" });
-      return;
-  }
-
-  if (text === "/ban") {
-      await env.TOPIC_MAP.put(`banned:${userId}`, "1");
-      await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: "🚫 **用户已封禁**", parse_mode: "Markdown" });
-      return;
-  }
-
-  if (text === "/unban") {
-      await env.TOPIC_MAP.delete(`banned:${userId}`);
-      await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: "✅ **用户已解封**", parse_mode: "Markdown" });
-      return;
-  }
-
-  if (text === "/info") {
-      const userKey = `user:${userId}`;
-      const userRec = await safeGetJSON(env, userKey, null);
-      const verifyStatus = await env.TOPIC_MAP.get(`verified:${userId}`);
-      const banStatus = await env.TOPIC_MAP.get(`banned:${userId}`);
-
-      const info = `👤 **用户信息**\nUID: \`${userId}\`\nTopic ID: \`${threadId}\`\n话题标题: ${userRec?.title || "未知"}\n验证状态: ${verifyStatus ? (verifyStatus === 'trusted' ? '🌟 永久信任' : '✅ 已验证') : '❌ 未验证'}\n封禁状态: ${banStatus ? '🚫 已封禁' : '✅ 正常'}\nLink: [点击私聊](tg://user?id=${userId})`;
-      await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: info, parse_mode: "Markdown" });
+  // --- 指令区域（与面板按钮共用 performAdminAction）---
+  if (parsed && isKnownAdminCommand(parsed.cmd)) {
+      const result = await performAdminAction(parsed.cmd, userId, threadId, env);
+      await tgCall(env, "sendMessage", withMessageThreadId({
+          chat_id: env.SUPERGROUP_ID,
+          text: result.ok ? result.text : `⚠️ ${result.toast}`,
+          parse_mode: "Markdown"
+      }, threadId));
       return;
   }
 
@@ -908,7 +1181,12 @@ async function sendVerificationChallenge(userId, env, pendingMsgId) {
 
 async function handleCallbackQuery(query, env, ctx) {
     try {
-        const data = query.data;
+        const data = query.data || "";
+        // 管理面板按钮（需管理员权限 + 话题归属校验）
+        if (data.startsWith("adm:")) {
+            await handleAdminCallback(query, env);
+            return;
+        }
         if (!data.startsWith("verify:")) return;
 
         const parts = data.split(":");
@@ -1251,6 +1529,8 @@ async function createTopic(from, key, env, userId) {
     await env.TOPIC_MAP.put(key, JSON.stringify(rec));
     if (userId) {
         await env.TOPIC_MAP.put(`thread:${rec.thread_id}`, String(userId));
+        // 新话题立即下发并置顶控制面板（内部已容错，失败不影响建话题）
+        await sendTopicPanel(env, userId, rec.thread_id);
     }
     return rec;
 }
