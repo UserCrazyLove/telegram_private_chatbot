@@ -21,7 +21,10 @@ const CONFIG = {
     MAX_CLEANUP_DISPLAY: 20,
     CLEANUP_LOCK_TTL_SECONDS: 1800,     // /cleanup 防并发锁 30 分钟
     MAX_RETRY_ATTEMPTS: 3,
-    THREAD_HEALTH_TTL_MS: 60000
+    THREAD_HEALTH_TTL_MS: 60000,
+    CONSOLE_MAX_TOPICS: 8,              // 私聊控制台一页显示的话题数
+    CONSOLE_INDEX_MAX: 40,              // 「最近话题」索引保留条数
+    CONSOLE_SCAN_LIMIT: 40              // 索引缺失时一次性扫描的读取上限（受子请求限制）
 };
 
 // 线程健康检查缓存，减少频繁探测请求
@@ -566,6 +569,7 @@ async function sendHelpCard(env, threadId) {
 }
 
 // 面板按钮回调：必须同时满足「点击者是管理员」与「按钮所属话题匹配」
+// 面板按钮回调：必须同时满足「点击者是管理员」与「按钮所属话题匹配」
 async function handleAdminCallback(query, env) {
     const parts = (query.data || "").split(":");
     if (parts.length !== 3) return;
@@ -584,11 +588,18 @@ async function handleAdminCallback(query, env) {
         return;
     }
 
-    const threadId = query.message?.message_thread_id;
+    // 群话题里点按钮 -> 用消息自带的 thread_id；私聊控制台里点 -> 从用户记录反查
+    const msgThreadId = query.message?.message_thread_id;
+    const isPrivateConsole = !msgThreadId;
+    let threadId = msgThreadId;
+    if (!threadId) {
+        const rec = await safeGetJSON(env, `user:${userId}`, null);
+        threadId = rec?.thread_id;
+    }
 
     // 防跨话题误操作：面板里的 userId 必须与话题映射一致
-    if (threadId) {
-        const mappedUser = await env.TOPIC_MAP.get(`thread:${threadId}`);
+    if (msgThreadId) {
+        const mappedUser = await env.TOPIC_MAP.get(`thread:${msgThreadId}`);
         if (mappedUser && Number(mappedUser) !== userId) {
             await tgCall(env, "answerCallbackQuery", {
                 callback_query_id: query.id,
@@ -601,7 +612,8 @@ async function handleAdminCallback(query, env) {
 
     if (action === "refresh") {
         await tgCall(env, "answerCallbackQuery", { callback_query_id: query.id, text: "🔄 已刷新" });
-        await refreshPanelMessage(query, env, userId, threadId);
+        if (isPrivateConsole) await refreshConsoleDetail(query, env, userId, threadId);
+        else await refreshPanelMessage(query, env, userId, threadId);
         return;
     }
 
@@ -614,16 +626,228 @@ async function handleAdminCallback(query, env) {
     });
 
     if (result.ok) {
-        await tgCall(env, "sendMessage", withMessageThreadId({
-            chat_id: env.SUPERGROUP_ID,
+        const body = {
+            chat_id: isPrivateConsole ? query.message?.chat?.id : env.SUPERGROUP_ID,
             text: result.text,
             parse_mode: "Markdown",
             disable_notification: true
-        }, threadId));
-        await refreshPanelMessage(query, env, userId, threadId);
+        };
+        await tgCall(env, "sendMessage", isPrivateConsole ? body : withMessageThreadId(body, msgThreadId));
+
+        if (isPrivateConsole) await refreshConsoleDetail(query, env, userId, threadId);
+        else await refreshPanelMessage(query, env, userId, threadId);
     }
 
-    Logger.info('admin_button_action', { action, userId, threadId, by: clickerId, ok: result.ok });
+    Logger.info('admin_button_action', {
+        action, userId, threadId, by: clickerId, ok: result.ok, fromPrivate: isPrivateConsole
+    });
+}
+
+// ---------------- 管理员私聊控制台 ----------------
+
+// 仅当可能是管理员时才做权限查询：ADMIN_IDS 存在且不含此人时零额外开销短路
+async function isAdminPrivateChat(msg, env) {
+    const uid = msg.from?.id;
+    if (!uid) return false;
+    const allowlist = parseAdminIdAllowlist(env);
+    if (allowlist && !allowlist.has(String(uid))) return false;
+    return await isAdminUser(env, uid);
+}
+
+function consoleTopicButton(item) {
+    const icon = item.closed ? "🚫" : "💬";
+    const title = (item.title || "未知").substring(0, 24);
+    return { text: `${icon} ${title}`, callback_data: `t:${item.userId}` };
+}
+
+// 话题列表：thread_id 越大越新，据此排序取最近若干个
+// 维护「最近话题」索引：避免控制台每次全量扫描 KV（免费版单次请求有子请求上限）
+async function touchTopicIndex(env, userId, threadId) {
+    try {
+        const raw = await env.TOPIC_MAP.get("idx:topics");
+        let list = [];
+        if (raw) {
+            try {
+                const parsed = JSON.parse(raw);
+                if (Array.isArray(parsed)) list = parsed;
+            } catch (e) {
+                list = [];
+            }
+        }
+        list = list.filter(it => it && it.u !== userId);
+        list.unshift({ u: userId, t: Number(threadId) });
+        if (list.length > CONFIG.CONSOLE_INDEX_MAX) list = list.slice(0, CONFIG.CONSOLE_INDEX_MAX);
+        await env.TOPIC_MAP.put("idx:topics", JSON.stringify(list));
+    } catch (e) {
+        Logger.warn('topic_index_failed', { userId, threadId, error: String(e && e.message) });
+    }
+}
+
+async function loadRecentTopics(env) {
+    let idx = [];
+    const raw = await env.TOPIC_MAP.get("idx:topics");
+    if (raw) {
+        try {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) idx = parsed;
+        } catch (e) {
+            idx = [];
+        }
+    }
+
+    if (idx.length > 0) {
+        const items = [];
+        for (const it of idx.slice(0, CONFIG.CONSOLE_MAX_TOPICS)) {
+            if (!it || !it.u) continue;
+            const rec = await safeGetJSON(env, `user:${it.u}`, null);
+            if (!rec || !rec.thread_id) continue;
+            items.push({
+                userId: it.u,
+                threadId: Number(rec.thread_id),
+                title: rec.title || "未知",
+                closed: !!rec.closed
+            });
+        }
+        return items;
+    }
+
+    // 索引缺失（老数据）：有限扫描一次并重建索引
+    const keys = await getAllKeys(env, "user:");
+    const collected = [];
+    for (const { name } of keys.slice(0, CONFIG.CONSOLE_SCAN_LIMIT)) {
+        const rec = await safeGetJSON(env, name, null);
+        if (!rec || !rec.thread_id) continue;
+        collected.push({
+            userId: Number(name.slice(5)),
+            threadId: Number(rec.thread_id),
+            title: rec.title || "未知",
+            closed: !!rec.closed
+        });
+    }
+    collected.sort((a, b) => b.threadId - a.threadId);
+    const top = collected.slice(0, CONFIG.CONSOLE_INDEX_MAX);
+    if (top.length > 0) {
+        await env.TOPIC_MAP.put("idx:topics", JSON.stringify(top.map(i => ({ u: i.userId, t: i.threadId }))));
+    }
+    return top.slice(0, CONFIG.CONSOLE_MAX_TOPICS);
+}
+
+async function buildConsoleView(env) {
+    const items = await loadRecentTopics(env);
+    const rows = items.map(it => [consoleTopicButton(it)]);
+    rows.push([{ text: "🔄 刷新列表", callback_data: "t:list" }]);
+
+    const text = items.length === 0
+        ? "🛠️ **管理控制台**\n\n暂无进行中的话题。\n用户私聊机器人并完成验证后，这里会出现对应话题。"
+        : `🛠️ **管理控制台**\n\n最近 **${items.length}** 个话题\n\n点击话题查看详情并操作。`;
+
+    return { text, reply_markup: { inline_keyboard: rows } };
+}
+
+async function sendConsole(env, chatId) {
+    const view = await buildConsoleView(env);
+    await tgCall(env, "sendMessage", {
+        chat_id: chatId,
+        text: view.text,
+        parse_mode: "Markdown",
+        reply_markup: view.reply_markup
+    });
+}
+
+// 话题详情：复用群内面板的文案与按钮，追加返回入口
+async function buildConsoleDetail(env, userId, threadId) {
+    const state = await getUserState(env, userId);
+    const keyboard = buildPanelKeyboard(state, userId);
+    keyboard.inline_keyboard.push([{ text: "⬅️ 返回列表", callback_data: "t:list" }]);
+    return { text: buildPanelText(userId, threadId, state), reply_markup: keyboard };
+}
+
+async function editConsoleMessage(query, env, view) {
+    const messageId = query.message?.message_id;
+    const chatId = query.message?.chat?.id;
+    if (!messageId || !chatId) return;
+    try {
+        await tgCall(env, "editMessageText", {
+            chat_id: chatId,
+            message_id: messageId,
+            text: view.text,
+            parse_mode: "Markdown",
+            reply_markup: view.reply_markup
+        });
+    } catch (e) {
+        Logger.warn('console_edit_failed', { error: String(e && e.message) });
+    }
+}
+
+async function refreshConsoleDetail(query, env, userId, threadId) {
+    if (!threadId) return;
+    await editConsoleMessage(query, env, await buildConsoleDetail(env, userId, threadId));
+}
+
+async function handleConsoleCallback(query, env) {
+    const clickerId = query.from?.id;
+    if (!clickerId || !(await isAdminUser(env, clickerId))) {
+        await tgCall(env, "answerCallbackQuery", {
+            callback_query_id: query.id,
+            text: "❌ 仅管理员可操作",
+            show_alert: true
+        });
+        return;
+    }
+
+    const arg = (query.data || "").slice(2);
+
+    if (arg === "list") {
+        await tgCall(env, "answerCallbackQuery", { callback_query_id: query.id, text: "🔄 已刷新" });
+        await editConsoleMessage(query, env, await buildConsoleView(env));
+        return;
+    }
+
+    const userId = Number(arg);
+    if (!Number.isFinite(userId)) return;
+
+    const rec = await safeGetJSON(env, `user:${userId}`, null);
+    if (!rec || !rec.thread_id) {
+        await tgCall(env, "answerCallbackQuery", {
+            callback_query_id: query.id,
+            text: "❌ 该话题记录已不存在，请刷新列表",
+            show_alert: true
+        });
+        return;
+    }
+
+    await tgCall(env, "answerCallbackQuery", { callback_query_id: query.id });
+    await editConsoleMessage(query, env, await buildConsoleDetail(env, userId, Number(rec.thread_id)));
+}
+
+// 管理员私聊：只回控制台卡片，不做客服转发
+async function handleAdminPrivateChat(msg, env) {
+    const chatId = msg.chat.id;
+    const parsed = parseCommand(msg.text || "");
+
+    // 普通文本静默忽略，避免每条消息都多一条回复
+    if (!parsed) return;
+
+    if (parsed.cmd === "start" || parsed.cmd === "menu" || parsed.cmd === "topics") {
+        await sendConsole(env, chatId);
+        return;
+    }
+
+    if (parsed.cmd === "help") {
+        const lines = ADMIN_COMMANDS.map(c => `/${c.command} — ${c.description}`).join("\n");
+        await tgCall(env, "sendMessage", {
+            chat_id: chatId,
+            text: `❓ **管理员指令**\n\n${lines}\n\n💡 群里的话题内有常驻面板；私聊发送 /menu 打开控制台。`,
+            parse_mode: "Markdown"
+        });
+        return;
+    }
+
+    await tgCall(env, "sendMessage", {
+        chat_id: chatId,
+        text: "ℹ️ 管理员指令需在**群组话题内**执行。\n\n私聊发送 /menu 打开控制台。",
+        parse_mode: "Markdown"
+    });
 }
 // 获取所有 KV keys（处理分页）
 async function getAllKeys(env, prefix) {
@@ -765,6 +989,11 @@ export default {
 async function handlePrivateMessage(msg, env, ctx) {
   const userId = msg.chat.id;
   const key = `user:${userId}`;
+  // 管理员私聊：走控制台，不建话题、不转发，避免把自己刷进群
+  if (await isAdminPrivateChat(msg, env)) {
+      await handleAdminPrivateChat(msg, env);
+      return;
+  }
 
   // 速率限制检查
   const rateLimit = await checkRateLimit(userId, env, 'message', CONFIG.RATE_LIMIT_MESSAGE, CONFIG.RATE_LIMIT_WINDOW);
@@ -1182,6 +1411,11 @@ async function sendVerificationChallenge(userId, env, pendingMsgId) {
 async function handleCallbackQuery(query, env, ctx) {
     try {
         const data = query.data || "";
+        // 私聊控制台：话题列表 / 话题详情
+        if (data.startsWith("t:")) {
+            await handleConsoleCallback(query, env);
+            return;
+        }
         // 管理面板按钮（需管理员权限 + 话题归属校验）
         if (data.startsWith("adm:")) {
             await handleAdminCallback(query, env);
@@ -1531,6 +1765,8 @@ async function createTopic(from, key, env, userId) {
         await env.TOPIC_MAP.put(`thread:${rec.thread_id}`, String(userId));
         // 新话题立即下发并置顶控制面板（内部已容错，失败不影响建话题）
         await sendTopicPanel(env, userId, rec.thread_id);
+        // 维护控制台的「最近话题」索引
+        await touchTopicIndex(env, userId, rec.thread_id);
     }
     return rec;
 }
